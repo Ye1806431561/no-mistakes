@@ -140,6 +140,20 @@ func newCancelledRunRebindFixture(t *testing.T, recoverCustody bool) *cancelledR
 	}
 }
 
+func TestFreshRunOwnershipRespectsPublishedRebaseGuidance(t *testing.T) {
+	published := branchsync.State{State: branchsync.StateCustodyReturned, Relation: branchsync.RelationDiverged, Safety: "recovery_required",
+		NextAction: &branchsync.NextAction{Code: "adopt_published"}}
+	if got := freshRunBranchOwnershipRefusal(published); got == nil || got.NextAction == nil || got.NextAction.Code != "adopt_published" {
+		t.Fatalf("published rebase must not start a fresh run: %#v", got)
+	}
+	unpublished := published
+	unpublished.Safety = "custody_returned"
+	unpublished.NextAction = &branchsync.NextAction{Code: "run_pipeline"}
+	if got := freshRunBranchOwnershipRefusal(unpublished); got != nil {
+		t.Fatalf("recovered unpublished correction should start a fresh run: %#v", got)
+	}
+}
+
 func TestTriggerProofRunRebindsGateAfterCancelledRunCustodyReturned(t *testing.T) {
 	f := newCancelledRunRebindFixture(t, true)
 	state := inspectAxiBranchSync(context.Background(), f.env)
@@ -147,7 +161,7 @@ func TestTriggerProofRunRebindsGateAfterCancelledRunCustodyReturned(t *testing.T
 		t.Fatalf("post-recovery state = %#v", state)
 	}
 
-	receipt, err := triggerProofRun(context.Background(), f.env, "main", f.current, nil, "validate corrected version", "", false, "nonce", "generation")
+	receipt, err := triggerProofRun(context.Background(), f.env, "main", f.current, nil, "validate corrected version", "", false, "nonce", "generation", "")
 	if err != nil {
 		t.Fatalf("fresh run promised by branch-sync status was refused: %v", err)
 	}
@@ -163,11 +177,21 @@ func TestTriggerProofRunRebindsGateAfterCancelledRunCustodyReturned(t *testing.T
 	}
 }
 
+func TestRecoveredCancelledRunDoesNotPromiseSymbolicGateRef(t *testing.T) {
+	f := newCancelledRunRebindFixture(t, true)
+	cliGit(t, f.gateDir, "update-ref", "refs/heads/other", f.cancelledFix)
+	cliGit(t, f.gateDir, "symbolic-ref", "refs/heads/main", "refs/heads/other")
+	state := inspectAxiBranchSync(context.Background(), f.env)
+	if state.NextAction != nil && state.NextAction.Code == "run_pipeline" {
+		t.Fatalf("symbolic gate ref must not promise a safe fresh run: %#v", state)
+	}
+}
+
 func TestTriggerProofRunStillRefusesUnrecoveredCancelledDivergence(t *testing.T) {
 	f := newCancelledRunRebindFixture(t, false)
 	gateBefore := cliGit(t, f.gateDir, "rev-parse", "refs/heads/main")
 
-	receipt, err := triggerProofRun(context.Background(), f.env, "main", f.current, nil, "validate corrected version", "", false, "nonce", "generation")
+	receipt, err := triggerProofRun(context.Background(), f.env, "main", f.current, nil, "validate corrected version", "", false, "nonce", "generation", "")
 	if err == nil || receipt != nil {
 		t.Fatalf("unsafe fresh run = receipt %#v, err %v", receipt, err)
 	}
@@ -197,8 +221,12 @@ func TestTriggerProofRunStillRefusesGateHeadMovedAfterCustodyReturn(t *testing.T
 	unsafeGateHead := cliGit(t, writer, "rev-parse", "HEAD")
 	cliGit(t, writer, "push", "origin", "HEAD:refs/heads/main")
 
-	receipt, err := triggerProofRun(context.Background(), f.env, "main", f.current, nil, "validate corrected version", "", false, "nonce", "generation")
-	if err == nil || receipt != nil || !strings.Contains(err.Error(), "at-risk commit") {
+	state := inspectAxiBranchSync(context.Background(), f.env)
+	if state.Safety != "blocked_gate_moved" || state.NextAction != nil {
+		t.Fatalf("moved gate must refuse a fresh run without suggesting adoption: %#v", state)
+	}
+	receipt, err := triggerProofRun(context.Background(), f.env, "main", f.current, nil, "validate corrected version", "", false, "nonce", "generation", "")
+	if err == nil || receipt != nil || !strings.Contains(err.Error(), "private gate head changed") {
 		t.Fatalf("moved unsafe gate head = receipt %#v, err %v", receipt, err)
 	}
 	if got := cliGit(t, f.gateDir, "rev-parse", "refs/heads/main"); got != unsafeGateHead {
@@ -293,7 +321,7 @@ func TestTriggerRunRejectedPushRestoresReconciledGateRef(t *testing.T) {
 	}
 
 	proofCtx, proofCancel := context.WithTimeout(context.Background(), 10*time.Second)
-	receipt, err := triggerProofRun(proofCtx, env, "main", liveHead, nil, "retry safely", "", false, "nonce", "generation")
+	receipt, err := triggerProofRun(proofCtx, env, "main", liveHead, nil, "retry safely", "", false, "nonce", "generation", "")
 	proofCancel()
 	if err == nil || !strings.Contains(err.Error(), "submission-rejected") || receipt != nil {
 		t.Fatalf("rejected proof submission: receipt=%#v err=%v", receipt, err)

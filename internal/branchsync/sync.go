@@ -2545,9 +2545,10 @@ func RunHeadUnmoved(state State) bool {
 }
 
 // classifyCustodyReturned reports a branch whose stranded terminal run was
-// explicitly recovered and never had a push binding. A diverged local head is
-// not ready to start a fresh run until the gate lane has safely adopted the
-// already-published rewrite; all other relationships remain informative only.
+// explicitly recovered and never had a push binding. A corrected local head
+// descending from the original submission can start a fresh run only while
+// the gate still holds the exact unpublished terminal head. A published rebase
+// that rewrote the submitted head keeps its explicit adopt_published path.
 func (s *Service) classifyCustodyReturned(ctx context.Context, state *State) {
 	state.State = StateCustodyReturned
 	state.Error = ""
@@ -2555,10 +2556,22 @@ func (s *Service) classifyCustodyReturned(ctx context.Context, state *State) {
 	if state.Relation == RelationDiverged {
 		branchRef := "refs/heads/" + state.Local.Branch
 		if strings.TrimSpace(s.GateDir) != "" {
-			gateHead, err := git.Run(ctx, s.GateDir, "rev-parse", branchRef+"^{commit}")
-			if err == nil && gateHead == state.Local.Head {
+			gateHead, exists, err := git.DirectRefTarget(ctx, s.GateDir, branchRef)
+			if err == nil && exists && gateHead == state.Local.Head {
 				state.Safety = "gate_ready"
 				state.NextAction = &NextAction{Code: "run_pipeline", Command: `no-mistakes axi run --intent "<what the user set out to accomplish>"`}
+				return
+			}
+			if err == nil && exists && gateHead == state.Pipeline.CurrentHead &&
+				state.Pipeline.SubmittedHead != "" && state.Pipeline.CurrentHead != state.Pipeline.SubmittedHead &&
+				isAncestor(ctx, s.workDir(), state.Pipeline.SubmittedHead, state.Local.Head) {
+				state.Safety = "custody_returned"
+				state.NextAction = &NextAction{Code: "run_pipeline", Command: `no-mistakes axi run --intent "<what the user set out to accomplish>"`}
+				return
+			}
+			if err == nil && exists && gateHead != state.Pipeline.CurrentHead {
+				state.Safety = "blocked_gate_moved"
+				state.Error = "private gate head changed after custody return; no fresh run was started"
 				return
 			}
 		}

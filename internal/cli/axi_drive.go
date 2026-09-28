@@ -543,6 +543,9 @@ func (e *branchOwnershipError) Error() string {
 	if e.state.Error != "" {
 		return e.state.Error
 	}
+	if e.state.Safety == "recovery_required" && e.state.State == branchsync.StateCustodyReturned {
+		return "custody-returned branch requires explicit gate adoption before a fresh run"
+	}
 	return "the pipeline still owns this branch; no fresh run was started"
 }
 
@@ -594,6 +597,11 @@ func freshRunBranchOwnershipRefusal(state branchsync.State) *branchsync.State {
 		return &state
 	case branchsync.StatePushInProgress:
 		return &state
+	case branchsync.StateCustodyReturned:
+		if state.Relation == branchsync.RelationDiverged && (state.Safety == "recovery_required" || state.Safety == "blocked_gate_moved") {
+			return &state // published rebases require adoption; moved gate refs require inspection
+		}
+		return nil
 	default:
 		return nil
 	}
@@ -612,7 +620,8 @@ func reconcileFreshRunGate(ctx context.Context, env *axiEnv, branch, submissionH
 		return gate.StaleBranchReconciliation{}, &branchOwnershipError{state: *refusal}
 	}
 	releasedHead := ""
-	if state.State == branchsync.StateCustodyReturned && state.Local.Branch == branch && terminalStatus(state.Pipeline.Status) {
+	if state.State == branchsync.StateCustodyReturned && state.Local.Branch == branch && terminalStatus(state.Pipeline.Status) &&
+		(state.Relation != branchsync.RelationDiverged || state.Safety == "custody_returned") {
 		releasedHead = state.Pipeline.CurrentHead
 	}
 	return gate.ReconcileStaleBranch(ctx, env.p.RepoDir(env.repo.ID), ".", branch, submissionHead, releasedHead)
@@ -759,6 +768,9 @@ func triggerProofRun(ctx context.Context, env *axiEnv, branch, headSHA string, s
 	}
 	if opt := formatOmitIntentPushOption(omitIntent); opt != "" {
 		pushOptions = append(pushOptions, opt)
+	}
+	if _, err := verificationplan.Resolve(env.p.RunInputsDir(), planID, env.repo.ID, branch, headSHA); err != nil {
+		return nil, err
 	}
 	reconciliation, err := reconcileFreshRunGate(ctx, env, branch, headSHA)
 	if err != nil {
