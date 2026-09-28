@@ -62,7 +62,10 @@ func newCancelledRunRebindFixture(t *testing.T, recoverCustody bool) *cancelledR
 	cliGit(t, workDir, "commit", "-m", "submitted work")
 	submitted := cliGit(t, workDir, "rev-parse", "HEAD")
 
-	repo, err := d.InsertRepo(workDir, "https://example.com/repo.git", "main")
+	target := filepath.Join(t.TempDir(), "target.git")
+	cliGit(t, workDir, "init", "--bare", target)
+	cliGit(t, workDir, "push", target, "HEAD:refs/heads/main")
+	repo, err := d.InsertRepo(workDir, target, "main")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -140,6 +143,106 @@ func newCancelledRunRebindFixture(t *testing.T, recoverCustody bool) *cancelledR
 	}
 }
 
+func TestPublishedDescendantCorrectionAlsoRequiresAdoption(t *testing.T) {
+	f := newCancelledRunRebindFixture(t, true)
+	target := f.repo.PushURL()
+	cliGit(t, f.workDir, "push", target, "HEAD:refs/heads/main")
+	state := inspectAxiBranchSync(context.Background(), f.env)
+	if state.NextAction == nil || state.NextAction.Code != "verify_publication" {
+		t.Fatalf("published descendant cannot be trusted from cached ancestry: %#v", state)
+	}
+	if refusal := freshRunBranchOwnershipState(context.Background(), f.env); refusal == nil || refusal.NextAction == nil || refusal.NextAction.Code != "adopt_published" {
+		t.Fatalf("published descendant bypassed adoption: %#v", refusal)
+	}
+	if _, err := reconcileFreshRunGate(context.Background(), f.env, "main", f.current); err == nil {
+		t.Fatal("published descendant was allowed to replace the gate")
+	}
+}
+
+func newRebasedCancelledRunFixture(t *testing.T) (*cancelledRunRebindFixture, string, string) {
+	t.Helper()
+	f := newCancelledRunRebindFixture(t, true)
+	base := cliGit(t, f.workDir, "rev-parse", f.submitted+"^")
+	target := f.repo.PushURL()
+	cliGit(t, f.workDir, "checkout", "-b", "new-main", base)
+	if err := os.WriteFile(filepath.Join(f.workDir, "upstream.txt"), []byte("new main\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cliGit(t, f.workDir, "add", "upstream.txt")
+	cliGit(t, f.workDir, "commit", "-m", "advance main")
+	cliGit(t, f.workDir, "checkout", "main")
+	cliGit(t, f.workDir, "rebase", "--onto", "new-main", base, "main")
+	corrected := cliGit(t, f.workDir, "rev-parse", "HEAD")
+	if corrected == f.current {
+		t.Fatal("the corrected head was not rewritten")
+	}
+	if cliGit(t, target, "rev-parse", "refs/heads/main") == corrected {
+		t.Fatal("correction was published")
+	}
+
+	return f, target, corrected
+}
+
+func TestRebasedUnpublishedCorrectionCanStartAfterLiveTargetCheck(t *testing.T) {
+	f, target, corrected := newRebasedCancelledRunFixture(t)
+	service := &branchsync.Service{DB: f.d, Repo: f.env.repo, WorkDir: f.workDir, GateDir: f.gateDir}
+	cached := service.InspectCached(context.Background())
+	if cached.NextAction == nil || cached.NextAction.Code != "verify_publication" {
+		t.Fatalf("cached guidance for ambiguous publication = %#v", cached)
+	}
+	checked := service.Refresh(context.Background())
+	if checked.NextAction == nil || checked.NextAction.Code != "run_pipeline" {
+		t.Fatalf("live target proves unpublished correction, got %#v", checked)
+	}
+	plan, err := reconcileFreshRunGate(context.Background(), f.env, "main", corrected)
+	if err != nil || plan.PreviousHead != f.cancelledFix {
+		t.Fatalf("unpublished fresh-run preparation: plan=%+v err=%v", plan, err)
+	}
+	if got := cliGit(t, target, "rev-parse", "refs/heads/main"); got != f.submitted {
+		t.Fatalf("private gate reconciliation changed the configured push target: %s", got)
+	}
+}
+
+func TestRebasedCorrectionRefusesFreshRunWhenTargetCannotBeChecked(t *testing.T) {
+	f, target, corrected := newRebasedCancelledRunFixture(t)
+	if err := os.Rename(target, target+".offline"); err != nil {
+		t.Fatal(err)
+	}
+	service := &branchsync.Service{DB: f.d, Repo: f.env.repo, WorkDir: f.workDir, GateDir: f.gateDir}
+	checked := service.Refresh(context.Background())
+	if checked.Safety != "blocked_offline" || checked.Error == "" || (checked.NextAction != nil && checked.NextAction.Code == "run_pipeline") {
+		t.Fatalf("unverifiable target must not authorize a launch: %#v", checked)
+	}
+	if refusal := freshRunBranchOwnershipState(context.Background(), f.env); refusal == nil || refusal.Safety != "blocked_offline" {
+		t.Fatalf("offline target bypassed fresh-run guard: %#v", refusal)
+	}
+	if _, err := reconcileFreshRunGate(context.Background(), f.env, "main", corrected); err == nil {
+		t.Fatal("offline target allowed gate reconciliation")
+	}
+	if got := cliGit(t, f.gateDir, "rev-parse", "refs/heads/main"); got != f.cancelledFix {
+		t.Fatalf("offline refusal changed gate head: %s", got)
+	}
+}
+
+func TestPublishedRebasedCorrectionStillRequiresExplicitAdoption(t *testing.T) {
+	f, target, corrected := newRebasedCancelledRunFixture(t)
+	cliGit(t, f.workDir, "push", "--force", target, "HEAD:refs/heads/main")
+	service := &branchsync.Service{DB: f.d, Repo: f.env.repo, WorkDir: f.workDir, GateDir: f.gateDir}
+	checked := service.Refresh(context.Background())
+	if checked.NextAction == nil || checked.NextAction.Code != "adopt_published" {
+		t.Fatalf("published head must require adoption: %#v", checked)
+	}
+	if refusal := freshRunBranchOwnershipState(context.Background(), f.env); refusal == nil || refusal.NextAction == nil || refusal.NextAction.Code != "adopt_published" {
+		t.Fatalf("fresh launch bypassed published-head adoption: %#v", refusal)
+	}
+	if _, err := reconcileFreshRunGate(context.Background(), f.env, "main", corrected); err == nil {
+		t.Fatal("published head bypassed adoption during gate reconciliation")
+	}
+	if got := cliGit(t, f.gateDir, "rev-parse", "refs/heads/main"); got != f.cancelledFix {
+		t.Fatalf("refused launch moved the gate: %s", got)
+	}
+}
+
 func TestFreshRunOwnershipRespectsPublishedRebaseGuidance(t *testing.T) {
 	published := branchsync.State{State: branchsync.StateCustodyReturned, Relation: branchsync.RelationDiverged, Safety: "recovery_required",
 		NextAction: &branchsync.NextAction{Code: "adopt_published"}}
@@ -157,8 +260,12 @@ func TestFreshRunOwnershipRespectsPublishedRebaseGuidance(t *testing.T) {
 func TestTriggerProofRunRebindsGateAfterCancelledRunCustodyReturned(t *testing.T) {
 	f := newCancelledRunRebindFixture(t, true)
 	state := inspectAxiBranchSync(context.Background(), f.env)
-	if state.State != branchsync.StateCustodyReturned || state.Safety != "custody_returned" || state.Relation != branchsync.RelationDiverged || state.NextAction == nil || state.NextAction.Code != "run_pipeline" {
-		t.Fatalf("post-recovery state = %#v", state)
+	if state.State != branchsync.StateCustodyReturned || state.Safety != "publication_unverified" || state.Relation != branchsync.RelationDiverged || state.NextAction == nil || state.NextAction.Code != "verify_publication" {
+		t.Fatalf("post-recovery cached state = %#v", state)
+	}
+	checked := axiBranchSyncService(f.env).Refresh(context.Background())
+	if checked.Safety != "custody_returned" || checked.NextAction == nil || checked.NextAction.Code != "run_pipeline" {
+		t.Fatalf("unpublished correction's live readiness = %#v", checked)
 	}
 
 	receipt, err := triggerProofRun(context.Background(), f.env, "main", f.current, nil, "validate corrected version", "", false, "nonce", "generation", "")

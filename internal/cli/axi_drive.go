@@ -565,8 +565,8 @@ func emitBranchOwnershipError(cmd *cobra.Command, ownershipErr *branchOwnershipE
 	return &exitError{code: 1}
 }
 
-func inspectAxiBranchSync(ctx context.Context, env *axiEnv) branchsync.State {
-	service := &branchsync.Service{
+func axiBranchSyncService(env *axiEnv) *branchsync.Service {
+	return &branchsync.Service{
 		DB:            env.d,
 		Repo:          env.repo,
 		WorkDir:       ".",
@@ -574,11 +574,23 @@ func inspectAxiBranchSync(ctx context.Context, env *axiEnv) branchsync.State {
 		Paths:         env.p,
 		RemoteTimeout: env.cfg.BranchSyncRemoteTimeout,
 	}
-	return service.InspectCached(ctx)
+}
+
+func inspectAxiBranchSync(ctx context.Context, env *axiEnv) branchsync.State {
+	return axiBranchSyncService(env).InspectCached(ctx)
+}
+
+func inspectAxiFreshRunBranchSync(ctx context.Context, env *axiEnv) branchsync.State {
+	service := axiBranchSyncService(env)
+	state := service.InspectCached(ctx)
+	if state.State == branchsync.StateCustodyReturned && state.Safety == "publication_unverified" {
+		return service.VerifyCustodyPublication(ctx)
+	}
+	return state
 }
 
 func freshRunBranchOwnershipState(ctx context.Context, env *axiEnv) *branchsync.State {
-	state := inspectAxiBranchSync(ctx, env)
+	state := inspectAxiFreshRunBranchSync(ctx, env)
 	return freshRunBranchOwnershipRefusal(state)
 }
 
@@ -598,8 +610,8 @@ func freshRunBranchOwnershipRefusal(state branchsync.State) *branchsync.State {
 	case branchsync.StatePushInProgress:
 		return &state
 	case branchsync.StateCustodyReturned:
-		if state.Relation == branchsync.RelationDiverged && (state.Safety == "recovery_required" || state.Safety == "blocked_gate_moved") {
-			return &state // published rebases require adoption; moved gate refs require inspection
+		if state.Relation == branchsync.RelationDiverged && state.Safety != "custody_returned" && state.Safety != "gate_ready" {
+			return &state // do not replace the gate without a safe, verified path
 		}
 		return nil
 	default:
@@ -615,7 +627,7 @@ func freshRunBranchOwnershipRefusal(state branchsync.State) *branchsync.State {
 // the run_pipeline action reported by branch sync. Every other divergent head
 // still needs the reconciler's content proof or is refused.
 func reconcileFreshRunGate(ctx context.Context, env *axiEnv, branch, submissionHead string) (gate.StaleBranchReconciliation, error) {
-	state := inspectAxiBranchSync(ctx, env)
+	state := inspectAxiFreshRunBranchSync(ctx, env)
 	if refusal := freshRunBranchOwnershipRefusal(state); refusal != nil {
 		return gate.StaleBranchReconciliation{}, &branchOwnershipError{state: *refusal}
 	}
